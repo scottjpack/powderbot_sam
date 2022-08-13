@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+import logging
+import random
+import signal
+import threading
+
+import bs4  # pip install beautifulsoup4
+import click  # pip install click
+import yaml  # pip install pyyaml
+import requests  # pip install requests
+import tabulate  # pip install tabulate
+from twilio.rest import Client  # pip install twilio
+
+
+# These are initialized in main()
+ITEM_CONFIG_FILE = ''
+TWILIO_CONFIG_FILE = ''
+TWILIO_CONFIG = {}
+ALL_ITEMS = {}
+CONFIGS_RELOADED = None
+
+
+class Component(object):
+    def __init__(self, name, url):
+        self.name = name
+        self.url = url
+        self.available = None
+
+
+def update_items(all_components, user_agent='powderbot/1.0'):
+    yahtzee = []
+
+    headers = {
+        'User-Agent': user_agent
+    }
+
+    logging.info('Refreshing inventory list')
+
+    for name in all_components:
+        component = all_components[name]
+        logging.debug(f'Checking {name}')
+
+        # Download the product page
+        r = requests.get(component.url, headers=headers)
+        if r.status_code != 200:
+            logging.error(f'  ERROR - {r.status_code}')
+            continue
+
+        # Get availability from meta tag
+        soup = bs4.BeautifulSoup(r.content, 'html.parser')
+        availability = soup.find("meta", property="product:availability")
+        is_available = availability.get("content") == 'instock'
+
+        # Track items that were previously unavailable and are now available. Ignore logic on first run.
+        if is_available and not component.available and component.available is not None:
+            logging.debug(f'  {component.name} is available')
+            yahtzee.append(component.name)
+
+        # Update component's availability
+        component.available = is_available
+
+    return yahtzee
+
+
+def notify(item_list):
+    logging.info('Detected new inventory! Sending SMS -> ' + ','.join(item_list))
+    client = Client(TWILIO_CONFIG['sid'], TWILIO_CONFIG['token'])
+    client.messages.create(
+        body='🤖🤖 Time to buy ' + ', '.join(item_list),
+        from_=TWILIO_CONFIG['src_number'],
+        to=TWILIO_CONFIG['dst_number']
+    )
+
+
+def load_configs():
+    # Initialize item configuration globals
+    global ITEM_CONFIG_FILE
+    global ALL_ITEMS
+    with open(ITEM_CONFIG_FILE) as f:
+        _components = yaml.load(f, Loader=yaml.Loader)
+        new_components = {name: Component(name, url) for name, url in _components.items()}
+    new_components |= ALL_ITEMS
+    ALL_ITEMS = new_components
+
+    # Initialize Twilio configuration globals
+    global TWILIO_CONFIG_FILE
+    global TWILIO_CONFIG
+    with open(TWILIO_CONFIG_FILE) as f:
+        TWILIO_CONFIG = yaml.load(f, Loader=yaml.Loader)
+
+    logging.info('Configurations have been reloaded')
+
+
+def sighup_handler(*args):
+    global CONFIGS_RELOADED
+    load_configs()
+    if isinstance(CONFIGS_RELOADED, threading.Event):
+        CONFIGS_RELOADED.set()
+
+
+def sleep(seconds):
+    global CONFIGS_RELOADED
+    CONFIGS_RELOADED = threading.Event()
+    CONFIGS_RELOADED.wait(seconds)
+    return CONFIGS_RELOADED.is_set()
+
+
+@click.command()
+@click.option('--item-config', type=click.Path(exists=True, readable=True), default='components.yaml')
+@click.option('--twilio-config', type=click.Path(exists=True, readable=True), default='twilio.yaml')
+@click.option('--sleep-duration', type=click.IntRange(0, 1200), default=15, help='Polling duration in seconds')
+# @click.option('--sleep', type=click.IntRange(0, 1200), default=15*60, help='Polling duration in seconds')
+@click.option('--jitter', type=click.FloatRange(0.0, 1.0), default=0.10, help='Polling jitter')
+@click.option('--debug', is_flag=True)
+def main(item_config, twilio_config, sleep_duration, jitter, debug):
+    # Configure logging
+    logging.basicConfig(
+        format='{asctime} {levelname}: {message}',
+        style='{',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        level=logging.DEBUG if debug else logging.INFO
+    )
+
+    # Initialize item list and Twilio parameters
+    global ITEM_CONFIG_FILE
+    ITEM_CONFIG_FILE = item_config
+    global TWILIO_CONFIG_FILE
+    TWILIO_CONFIG_FILE = twilio_config
+    load_configs()
+
+    # Catch SIGHUP, which forces a configuration reload
+    signal.signal(signal.SIGHUP, sighup_handler)
+
+    # Periodically re-check availability
+    while True:
+        in_stock_items = update_items(ALL_ITEMS)
+
+        # Log statuses of all components
+        results = [(component.name, component.available, component.url) for component in ALL_ITEMS.values()]
+        logging.info(tabulate.tabulate(results, headers=('Item', 'Available', 'URL'), tablefmt='pretty'))
+
+        # Send SMS if new product availability was detected
+        if in_stock_items:
+            notify(in_stock_items)
+        else:
+            logging.info('No new inventory detected')
+
+        # Sleep for unpredictable amount that is with jitter of the intended sleep cycle
+        jitter_seconds = int(sleep_duration * jitter)
+        sleep_duration = sleep_duration + random.randint(-1 * jitter_seconds, 1 * jitter_seconds)
+        logging.info(f'Sleeping for {sleep_duration} seconds')
+
+        # Sleep may be interrupted by configuration reloads (i.e. kill -HUP)
+        # The return value of sleep() indicates whether that happened, if that's needed
+        sleep(sleep_duration)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,123 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: PowderBotAWS
+
+
+Resources:
+  ComponentStateFetcher:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Powderbot Function
+      Environment:
+        Variables:
+          components_table: !Ref ComponentsTable
+      CodeUri: powderbot
+      Handler: powderbot.lambda_handler
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComponentsTable
+      Runtime: python3.7
+      Timeout: 300
+      Events:
+        TriggerEveryMinute:
+          Type: Schedule
+          Properties:
+            Schedule: minute(1 minutes)
+
+  NotificationManager:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: SNS Notification Manager
+      Environment:
+        Variables:
+          topic_arn: !Ref InStockNotificationTopic
+          notification_targets_table: !Ref NotificationTargetsTable
+      CodeUri: notification_manager
+      Handler: notification_manager.lambda_handler
+      MemorySize: 256
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationTargetsTable
+        - SNSCrudPolicy:
+            TopicName: !GetAtt InStockNotificationTopic.TopicName
+      Runtime: python3.7
+      Timeout: 300
+
+  ComponentStreamWatcher:
+    Type: AWS::Serverless::Function
+    DependsOn: TableContentsInitTrigger
+    Properties:
+      Description: Component change watcher
+      Environment:
+        Variables:
+          topic_arn: !Ref InStockNotificationTopic
+      CodeUri: component_stream_watcher
+      Handler: component_stream_watcher.lambda_handler
+      MemorySize: 256
+      Policies:
+        - SNSPublishMessagePolicy:
+            TopicName: !GetAtt InStockNotificationTopic.TopicName
+      Runtime: python3.7
+      Timeout: 300
+      Events:
+        Stream:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt ComponentsTable.StreamArn
+            BatchSize: 1
+            StartingPosition: TRIM_HORIZON
+
+  TableContentsInitTrigger:
+    Type: Custom::InitFunction
+    DependsOn: 
+      - ComponentsTable
+      - NotificationTargetsTable
+    Properties:
+      ServiceToken:
+        Fn::GetAtt: [ TableContentsInit , "Arn" ]
+
+  TableContentsInit:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: table_init
+      Handler: table_init.lambda_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref ComponentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotificationTargetsTable
+      Runtime: python3.7
+      Timeout: 60
+
+  ComponentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: components_table
+      AttributeDefinitions:
+        - AttributeName: component_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: component_name
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+
+  NotificationTargetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: notification_targets_table
+      AttributeDefinitions:
+        - AttributeName: phone_number
+          AttributeType: S
+      KeySchema:
+        - AttributeName: phone_number
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  InStockNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: InStockNotifications
